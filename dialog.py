@@ -223,6 +223,20 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		self.combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 		self.combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
 		self.combo.setMinimumContentsLength(28)
+
+		# Make the combo searchable without letting users add new items
+		self.combo.setEditable(True)
+		self.combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+
+		# Nice UX: hint in the field
+		self.combo.lineEdit().setPlaceholderText("Type to search…")
+
+		# Autocomplete settings: popup list, case-insensitive, match ANYWHERE
+		comp = self.combo.completer()
+		comp.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+		comp.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+		comp.setFilterMode(QtCore.Qt.MatchContains)
+
 		top.addWidget(self.combo, 1)
 
 		# Editor
