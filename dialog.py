@@ -10,6 +10,8 @@ import re
 
 _ident_rx = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
+RELATION_SENTINEL = "__RELATION__"
+
 # -------------------- GPKG helpers --------------------
 
 def _is_gpkg_layer(lyr):
@@ -54,6 +56,96 @@ def _gpkg_set_comment(path: str, table: str, text: str):
 		con.commit()
 	finally:
 		con.close()
+
+# ----- GPKG column comments -----
+
+def _gpkg__canonical_table(path: str, table: str) -> str:
+    """Return the exact-cased table_name as stored in gpkg_contents (or the input if not found)."""
+    con = sqlite3.connect(path, timeout=2)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        row = con.execute(
+            "SELECT table_name FROM gpkg_contents WHERE lower(table_name)=lower(?)",
+            (table,)
+        ).fetchone()
+        return row[0] if row and row[0] else table
+    finally:
+        con.close()
+
+def _gpkg__canonical_column(path: str, table_exact: str, col: str) -> str:
+    """Return the exact-cased column name from PRAGMA table_info, or the input if not found."""
+    con = sqlite3.connect(path, timeout=2)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        qtbl = '"' + table_exact.replace('"', '""') + '"'
+        rows = con.execute(f"PRAGMA table_info({qtbl})").fetchall()
+        for r in rows:
+            # r[1] = name
+            if r[1].lower() == col.lower():
+                return r[1]
+        return col
+    finally:
+        con.close()
+
+def _gpkg_list_columns(path: str, table: str):
+    con = sqlite3.connect(path, timeout=2)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        table_exact = _gpkg__canonical_table(path, table)
+        qtbl = '"' + table_exact.replace('"', '""') + '"'
+        cur = con.execute(f"PRAGMA table_info({qtbl})")
+        return [r[1] for r in cur.fetchall()]  # r[1] is column name
+    finally:
+        con.close()
+
+def _gpkg_fetch_column_comment(path: str, table: str, col: str) -> str:
+    con = sqlite3.connect(path, timeout=2)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        # Ensure spec table exists
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS gpkg_data_columns (
+              table_name TEXT NOT NULL,
+              column_name TEXT NOT NULL,
+              name TEXT, title TEXT, description TEXT, mime_type TEXT, constraint_name TEXT,
+              PRIMARY KEY (table_name, column_name)
+            )
+        """)
+        table_exact = _gpkg__canonical_table(path, table)
+        col_exact = _gpkg__canonical_column(path, table_exact, col)
+        row = con.execute("""
+            SELECT description
+            FROM gpkg_data_columns
+            WHERE table_name=? AND column_name=?;
+        """, (table_exact, col_exact)).fetchone()
+        return row[0] if row and row[0] else ""
+    finally:
+        con.close()
+
+def _gpkg_set_column_comment(path: str, table: str, col: str, text: str):
+    con = sqlite3.connect(path, timeout=2)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS gpkg_data_columns (
+              table_name TEXT NOT NULL,
+              column_name TEXT NOT NULL,
+              name TEXT, title TEXT, description TEXT, mime_type TEXT, constraint_name TEXT,
+              PRIMARY KEY (table_name, column_name)
+            )
+        """)
+        table_exact = _gpkg__canonical_table(path, table)
+        col_exact = _gpkg__canonical_column(path, table_exact, col)
+        con.execute("""
+            INSERT INTO gpkg_data_columns (table_name, column_name, description)
+            VALUES (?, ?, ?)
+            ON CONFLICT(table_name, column_name)
+            DO UPDATE SET description=excluded.description;
+        """, (table_exact, col_exact, (text if text != "" else None)))
+        con.commit()
+    finally:
+        con.close()
+
 
 # -------------------- PostgreSQL helpers --------------------
 
@@ -153,6 +245,39 @@ def _pg_is_query_layer(lyr):
 		# If we can't parse it safely, treat as query layer (skip)
 		return True
 
+# ----- PG column comments -----
+
+def _pg_fetch_column_comment(conn, schema: str, table: str, col: str) -> str:
+    qt = _qualify(schema, table)
+    sql = f"""
+        SELECT col_description('{qt}'::regclass, a.attnum)
+        FROM pg_attribute a
+        WHERE a.attrelid = '{qt}'::regclass
+          AND a.attname = {_pick_dollar_tag(col)}{col}{_pick_dollar_tag(col)};
+    """
+    rows = conn.executeSql(sql)
+    if rows and rows[0]:
+        return rows[0][0] or ""
+    return ""
+
+def _pg_set_column_comment(conn, schema: str, table: str, col: str, text: str):
+    qcol = f'{_qualify(schema, table)}.{_quote_ident(col)}'
+    if text in (None, ""):
+        conn.executeSql(f"COMMENT ON COLUMN {qcol} IS NULL;")
+    else:
+        tag = _pick_dollar_tag(text)
+        conn.executeSql(f"COMMENT ON COLUMN {qcol} IS {tag}{text}{tag};")
+
+def _pg_list_columns(conn, schema: str, table: str):
+    qt = _qualify(schema, table)
+    rows = conn.executeSql(f"""
+        SELECT a.attname::text
+        FROM pg_attribute a
+        WHERE a.attrelid = '{qt}'::regclass
+          AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum;
+    """)
+    return [r[0] for r in rows] if rows else []
 
 # -------------------- Shared helpers --------------------
 
@@ -204,6 +329,8 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		self.layers = layers if layers is not None else supported_layers()
 		self._original_by_layerid = {}   # layer_id -> original comment
 		self._group_by_label = {}  # full_label -> [layer_id, ...]
+		self._original_column_by_layerid = {}  # (layer_id, col_name) -> original text
+
 
 		# ---- Build UI (create widgets BEFORE any loads) ----
 		# Clamp dialog size to screen and allow shrinking
@@ -239,6 +366,20 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 
 		top.addWidget(self.combo, 1)
 
+		# --- Target row: Relation vs Field ---
+		targetRow = QtWidgets.QHBoxLayout()
+		targetRow.addWidget(QtWidgets.QLabel("Target:"))
+		self.comboTarget = QtWidgets.QComboBox()
+		self.comboTarget.setEditable(True)
+		self.comboTarget.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+		# Autocomplete: popup, case-insensitive, contains
+		compT = self.comboTarget.completer()
+		compT.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+		compT.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+		compT.setFilterMode(QtCore.Qt.MatchContains)
+		self.comboTarget.lineEdit().setPlaceholderText("Type to search a field…")
+		targetRow.addWidget(self.comboTarget, 1)
+
 		# Editor
 		self.text = QtWidgets.QTextEdit()
 		self.text.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
@@ -268,6 +409,7 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		# Main layout
 		lay = QtWidgets.QVBoxLayout(self)
 		lay.addLayout(top)
+		lay.addLayout(targetRow)
 		lay.addWidget(QtWidgets.QLabel("Edit relation comment:"))
 		lay.addWidget(self.text, 1)
 		lay.addWidget(self.status)
@@ -288,12 +430,16 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 
 		# Connect signals
 		self.combo.currentIndexChanged.connect(self._load_selected)
+		self.combo.currentIndexChanged.connect(self._rebuild_target_list)
+		self.comboTarget.currentIndexChanged.connect(self._load_target)
 		self.btnUpdate.clicked.connect(self._update_comment)
 		self.btnRevert.clicked.connect(self._revert_comment)
 		self.btnClose.clicked.connect(self.accept)
 
 		# Initial load
 		self._load_selected()
+		self._rebuild_target_list()
+		self._load_target()
 
 		# Elide long entries in the dropdown view (after creation)
 		if self.combo.view():
@@ -319,7 +465,6 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		except Exception:
 			pass
 		return lyr.name()
-
 
 	def _add_combo_item(self, lyr):
 		"""
@@ -366,6 +511,53 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		layer_id = self.combo.itemData(idx, QtCore.Qt.UserRole)
 		return QgsProject.instance().mapLayer(layer_id)
 
+	def _rebuild_target_list(self):
+	    """Fill comboTarget with 'Relation comment' + columns for the current layer."""
+	    self.comboTarget.blockSignals(True)
+	    self.comboTarget.clear()
+
+	    lyr = self._current_layer()
+	    if not lyr:
+	        self.comboTarget.blockSignals(False)
+	        return
+
+	    # --- Query-layer guard ---
+	    if _is_postgres_layer(lyr) and _pg_is_query_layer(lyr):
+	        # leave it empty/disabled; _load_selected already set status
+	        self.comboTarget.setEnabled(False)
+	        self.comboTarget.blockSignals(False)
+	        return
+	    else:
+	        self.comboTarget.setEnabled(True)
+
+	    # First entry = relation-level
+	    self.comboTarget.addItem("Relation (table/view) comment")
+	    self.comboTarget.setItemData(0, (RELATION_SENTINEL, None), QtCore.Qt.UserRole)
+
+	    # Then fields
+	    try:
+	        if _is_postgres_layer(lyr):
+	            uri, schema, table = _layer_uri_parts(lyr)
+	            conn = _pg_conn_from_uri(uri)
+	            cols = _pg_list_columns(conn, schema, table)
+	        elif _is_gpkg_layer(lyr):
+	            path, table = _gpkg_path_and_table(lyr)
+	            cols = _gpkg_list_columns(path, table)
+	        else:
+	            cols = []
+	    except Exception:
+	        cols = []
+
+	    for col in cols:
+	        self.comboTarget.addItem(f"Field: {col}")
+	        # store tuple ('col', column_name)
+	        self.comboTarget.setItemData(self.comboTarget.count()-1, ("col", col), QtCore.Qt.UserRole)
+
+	    self.comboTarget.blockSignals(False)
+	    # default to relation-level
+	    self.comboTarget.setCurrentIndex(0)
+
+
 	# ---------- Load / Update / Revert ----------
 
 	def _load_selected(self):
@@ -411,108 +603,203 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 		id_now = lyr.id()
 		self._original_by_layerid[id_now] = comment
 
+		# if user was viewing a column, refresh that view to match new layer
+		if self.comboTarget.count() > 0 and self.comboTarget.currentIndex() > 0:
+		    self._load_target()
+
+	def _load_target(self):
+	    """Load the comment for the current Target (relation or column) into the editor."""
+	    lyr = self._current_layer()
+	    if not lyr or self.comboTarget.count() == 0:
+	        return
+
+	    # --- Query-layer guard ---
+	    if _is_postgres_layer(lyr) and _pg_is_query_layer(lyr):
+	        self.text.setPlainText("")
+	        self.status.setText("Unsupported: Postgres query layers (no single base relation).")
+	        self.btnUpdate.setEnabled(False)
+	        self.btnRevert.setEnabled(False)
+	        return
+	    else:
+	        self.btnUpdate.setEnabled(True)
+	        self.btnRevert.setEnabled(True)
+
+
+	    kind, col = self.comboTarget.itemData(self.comboTarget.currentIndex(), QtCore.Qt.UserRole)
+
+	    # Toggle Abstract sync checkbox: only enabled for relation-level
+	    if hasattr(self, "chkSyncAll"):
+	        self.chkSyncAll.setEnabled(kind == RELATION_SENTINEL)
+
+	    if kind == RELATION_SENTINEL:
+	        # Reuse relation loader
+	        self._load_selected()
+	        return
+
+	    # Column-level load
+	    comment = ""
+	    where = ""
+	    try:
+	        if _is_postgres_layer(lyr):
+	            uri, schema, table = _layer_uri_parts(lyr)
+	            conn = _pg_conn_from_uri(uri)
+	            comment = _pg_fetch_column_comment(conn, schema, table, col) or ""
+	            where = f"PG [COLUMN] {schema}.{table}.{col}"
+	        elif _is_gpkg_layer(lyr):
+	            path, table = _gpkg_path_and_table(lyr)
+	            comment = _gpkg_fetch_column_comment(path, table, col) or ""
+	            where = f"GPKG [COLUMN] {os.path.basename(path)}::{table}.{col}"
+	        else:
+	            where = "Unsupported layer"
+	    except Exception as e:
+	        where = f"Load error: {e}"
+	        QgsMessageLog.logMessage(f"[TableCommentNotepad] Column load error: {e}", "TableCommentNotepad", Qgis.Warning)
+
+	    self.text.setPlainText(comment)
+	    self.status.setText(f"Loaded {where}" if where else "Loaded")
+	    self._original_column_by_layerid[(lyr.id(), col)] = comment
+
 	def _update_comment(self):
-		# Work with the currently selected layer (by id)
-		lyr = self._current_layer()
-		if not lyr:
-			return
+	    lyr = self._current_layer()
+	    if not lyr:
+	        return
 
-		txt = self.text.toPlainText()
-		original = self._original_by_layerid.get(lyr.id(), "")
+	    if _is_postgres_layer(lyr) and _pg_is_query_layer(lyr):
+	        QtWidgets.QMessageBox.warning(self, "Unsupported",
+	            "PostgreSQL query layers (JOINs/subqueries) have no single base relation to comment.")
+	        return
 
-		try:
-			# --- write only if changed ---
-			if _is_postgres_layer(lyr):
-				uri, schema, table = _layer_uri_parts(lyr)
-				conn = _pg_conn_from_uri(uri)
-				if txt != original:
-					_set_comment(conn, schema, table, txt)
-				where = f"PG { _pg_type_label(conn, schema, table) } {schema}.{table}"
-			elif _is_gpkg_layer(lyr):
-				path, table = _gpkg_path_and_table(lyr)
-				if txt != original:
-					_gpkg_set_comment(path, table, txt)
-				where = f"GPKG {os.path.basename(path)}::{table}"
-			else:
-				return  # unsupported
+	    kind, col = self.comboTarget.itemData(self.comboTarget.currentIndex(), QtCore.Qt.UserRole)
+	    txt = self.text.toPlainText()
 
-			# --- sync Abstracts only if checkbox is ON ---
-			updated_n = self._apply_abstract(lyr, txt)
+	    try:
+	        if kind == RELATION_SENTINEL:
+	            # ===== relation-level (existing behavior) =====
+	            original = self._original_by_layerid.get(lyr.id(), "")
+	            if _is_postgres_layer(lyr):
+	                uri, schema, table = _layer_uri_parts(lyr)
+	                conn = _pg_conn_from_uri(uri)
+	                if txt != original:
+	                    _set_comment(conn, schema, table, txt)
+	                where = f"PG { _pg_type_label(conn, schema, table) } {schema}.{table}"
+	            elif _is_gpkg_layer(lyr):
+	                path, table = _gpkg_path_and_table(lyr)
+	                if txt != original:
+	                    _gpkg_set_comment(path, table, txt)
+	                where = f"GPKG {os.path.basename(path)}::{table}"
+	            else:
+	                return
 
-			if txt == original:
-				# no DB/file write; optionally report Abstract sync
-				if updated_n:
-					self.status.setText(f"No changes; Abstract synced to {updated_n} layer(s).")
-					QtWidgets.QMessageBox.information(self, "No changes",
-													  f"Abstract synced to {updated_n} layer(s).")
-				else:
-					self.status.setText("No changes.")
-				return
+	            updated_n = self._apply_abstract(lyr, txt)  # only if checkbox is ON
 
-			# mark new baseline & report success
-			self._original_by_layerid[lyr.id()] = txt
-			if updated_n:
-				self.status.setText(f"Updated {where}; Abstract synced to {updated_n} layer(s).")
-			else:
-				self.status.setText(f"Updated {where}.")
-			QtWidgets.QMessageBox.information(self, "Success", "Comment updated.")
+	            if txt == original:
+	                if updated_n:
+	                    self.status.setText(f"No changes; Abstract synced to {updated_n} layer(s).")
+	                    QtWidgets.QMessageBox.information(self, "No changes",
+	                                                      f"Abstract synced to {updated_n} layer(s).")
+	                else:
+	                    self.status.setText("No changes.")
+	                return
 
-		except Exception as e:
-			self.status.setText(f"Update failed: {e}")
-			QtWidgets.QMessageBox.critical(self, "Update failed", str(e))
+	            self._original_by_layerid[lyr.id()] = txt
+	            self.status.setText(f"Updated {where}" + (f"; Abstract synced to {updated_n} layer(s)." if updated_n else "."))
+	            QtWidgets.QMessageBox.information(self, "Success", "Comment updated.")
 
+	        else:
+	            # ===== column-level =====
+	            original = self._original_column_by_layerid.get((lyr.id(), col), "")
+	            if _is_postgres_layer(lyr):
+	                uri, schema, table = _layer_uri_parts(lyr)
+	                conn = _pg_conn_from_uri(uri)
+	                if txt != original:
+	                    _pg_set_column_comment(conn, schema, table, col, txt)
+	                where = f"PG [COLUMN] {schema}.{table}.{col}"
+	            elif _is_gpkg_layer(lyr):
+	                path, table = _gpkg_path_and_table(lyr)
+	                if txt != original:
+	                    _gpkg_set_column_comment(path, table, col, txt)
+	                where = f"GPKG [COLUMN] {os.path.basename(path)}::{table}.{col}"
+	            else:
+	                return
+
+	            # No Abstract sync for columns
+	            if txt == original:
+	                self.status.setText("No changes.")
+	                return
+
+	            self._original_column_by_layerid[(lyr.id(), col)] = txt
+	            self.status.setText(f"Updated {where}.")
+	            QtWidgets.QMessageBox.information(self, "Success", "Column comment updated.")
+
+	    except Exception as e:
+	        self.status.setText(f"Update failed: {e}")
+	        QtWidgets.QMessageBox.critical(self, "Update failed", str(e))
 
 	def _revert_comment(self):
-		# Work with the currently selected layer (by id)
-		lyr = self._current_layer()
-		if not lyr:
-			return
+	    lyr = self._current_layer()
+	    if not lyr:
+	        return
 
-		original = self._original_by_layerid.get(lyr.id(), "")
+	    if _is_postgres_layer(lyr) and _pg_is_query_layer(lyr):
+	        QtWidgets.QMessageBox.warning(self, "Unsupported",
+	            "PostgreSQL query layers (JOINs/subqueries) have no single base relation to comment.")
+	        return
 
-		# --- if editor already matches original, just (optionally) sync Abstracts ---
-		if self.text.toPlainText() == original:
-			updated_n = self._apply_abstract(lyr, original)
-			if updated_n:
-				self.status.setText(f"No changes; Abstract synced to {updated_n} layer(s).")
-				QtWidgets.QMessageBox.information(self, "No changes",
-												  f"Abstract synced to {updated_n} layer(s).")
-			else:
-				self.status.setText("No changes.")
-			return
+	    kind, col = self.comboTarget.itemData(self.comboTarget.currentIndex(), QtCore.Qt.UserRole)
 
-		try:
-			# --- write ORIGINAL back to the DB / file ---
-			if _is_postgres_layer(lyr):
-				uri, schema, table = _layer_uri_parts(lyr)
-				conn = _pg_conn_from_uri(uri)
-				_set_comment(conn, schema, table, original)
-				where = f"PG { _pg_type_label(conn, schema, table) } {schema}.{table}"
-			elif _is_gpkg_layer(lyr):
-				path, table = _gpkg_path_and_table(lyr)
-				_gpkg_set_comment(path, table, original)
-				where = f"GPKG {os.path.basename(path)}::{table}"
-			else:
-				return  # unsupported
+	    try:
+	        if kind == RELATION_SENTINEL:
+	            original = self._original_by_layerid.get(lyr.id(), "")
+	            if self.text.toPlainText() == original:
+	                updated_n = self._apply_abstract(lyr, original)  # only if checkbox ON
+	                self.status.setText("No changes." if not updated_n else f"No changes; Abstract synced to {updated_n} layer(s).")
+	                return
 
-			# --- reset editor & baseline ---
-			self.text.setPlainText(original)
-			self._original_by_layerid[lyr.id()] = original
+	            if _is_postgres_layer(lyr):
+	                uri, schema, table = _layer_uri_parts(lyr)
+	                conn = _pg_conn_from_uri(uri)
+	                _set_comment(conn, schema, table, original)
+	                where = f"PG { _pg_type_label(conn, schema, table) } {schema}.{table}"
+	            elif _is_gpkg_layer(lyr):
+	                path, table = _gpkg_path_and_table(lyr)
+	                _gpkg_set_comment(path, table, original)
+	                where = f"GPKG {os.path.basename(path)}::{table}"
+	            else:
+	                return
 
-			# --- sync Abstracts only if checkbox is ON ---
-			updated_n = self._apply_abstract(lyr, original)
+	            self.text.setPlainText(original)
+	            self._original_by_layerid[lyr.id()] = original
+	            updated_n = self._apply_abstract(lyr, original)  # only if checkbox ON
+	            self.status.setText(f"Reverted {where}" + (f"; Abstract synced to {updated_n} layer(s)." if updated_n else "."))
+	            QtWidgets.QMessageBox.information(self, "Reverted", "Comment reverted.")
 
-			if updated_n:
-				self.status.setText(f"Reverted {where}; Abstract synced to {updated_n} layer(s).")
-			else:
-				self.status.setText(f"Reverted {where}.")
-			QtWidgets.QMessageBox.information(self, "Reverted", "Comment reverted.")
+	        else:
+	            original = self._original_column_by_layerid.get((lyr.id(), col), "")
+	            if self.text.toPlainText() == original:
+	                self.status.setText("No changes.")
+	                return
 
-		except Exception as e:
-			self.status.setText(f"Revert failed: {e}")
-			QtWidgets.QMessageBox.critical(self, "Revert failed", str(e))
+	            if _is_postgres_layer(lyr):
+	                uri, schema, table = _layer_uri_parts(lyr)
+	                conn = _pg_conn_from_uri(uri)
+	                _pg_set_column_comment(conn, schema, table, col, original)
+	                where = f"PG [COLUMN] {schema}.{table}.{col}"
+	            elif _is_gpkg_layer(lyr):
+	                path, table = _gpkg_path_and_table(lyr)
+	                _gpkg_set_column_comment(path, table, col, original)
+	                where = f"GPKG [COLUMN] {os.path.basename(path)}::{table}.{col}"
+	            else:
+	                return
 
+	            self.text.setPlainText(original)
+	            self._original_column_by_layerid[(lyr.id(), col)] = original
+	            # no Abstract sync for columns
+	            self.status.setText(f"Reverted {where}.")
+	            QtWidgets.QMessageBox.information(self, "Reverted", "Column comment reverted.")
 
+	    except Exception as e:
+	        self.status.setText(f"Revert failed: {e}")
+	        QtWidgets.QMessageBox.critical(self, "Revert failed", str(e))
 
 	# ---------- Layer abstract helper ----------
 
@@ -530,7 +817,6 @@ class CommentNotepadDialog(QtWidgets.QDialog):
 			if l:
 				self._apply_abstract_to_layer(l, txt or "")
 		return len(targets)
-
 
 	def _apply_abstract_to_layer(self, layer, txt: str):
 		try:
