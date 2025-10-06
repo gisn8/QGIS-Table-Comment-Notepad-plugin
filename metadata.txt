@@ -2,7 +2,7 @@
 name=Table Comment Notepad
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
-description=Read and edit PostgreSQL table comments for loaded PostGIS layers, with Update/Revert. Great for keeping QGIS Abstract metadata in sync with DB comments.
+description=Read and edit table and column comments for loaded PostGIS/GPKG layers, with Update/Revert. Great for keeping QGIS Abstract metadata in sync with DB comments.
 about=Lists loaded PostGIS layers, shows their current table comment, lets you edit in a full-sized text area, and push changes back to PostgreSQL (or revert). Uses QGIS provider connection—no external libs.
 version=1.0.0
 author=Nathan Saylor + ChatGPT
@@ -16,5 +16,6 @@ experimental=False
 deprecated=False
 tags=postgres,postgis,metadata,comments,qgis,abstract
 changelog=
+    2025-10-06: Added column-level commenting functinaility.
     2025-09-30: Added filterable combobox; updated metadata
     Initial release.
