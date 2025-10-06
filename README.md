@@ -1,5 +1,7 @@
 # Table Comment Notepad (QGIS Plugin)
 
+Annoyed with limited interfaces to write comments on PG and GPKG database tables, a simple plugin to give me ample space to keep notes and changelogs on my tables.
+
 A Chat-GPTv5-generated utility to read/edit **PostgreSQL/GeoPackage table comments** for loaded PostGIS and GeoPackage layers, with a comfortable text box and **Update/Revert** buttons. Perfect if you use table comments as your metadata changelog and want that to flow into QGIS “Abstract” and Shapefile exports.
 
 ## Features
