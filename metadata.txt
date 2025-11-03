@@ -16,6 +16,6 @@ experimental=False
 deprecated=False
 tags=postgres,postgis,metadata,comments,qgis,abstract
 changelog=
-    2025-10-06: Added column-level commenting functinaility.
+    2025-10-06: Added column-level commenting functionality.
     2025-09-30: Added filterable combobox; updated metadata
     Initial release.
